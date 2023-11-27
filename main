@@ -1,0 +1,172 @@
+#!/bin/bash
+# A script to help download from this site without signing up
+
+_scriptRoot="$(dirname $(realpath $0))"
+_projectName="$(basename ${_scriptRoot})"
+
+_projectCommit="$(git -C "${_scriptRoot}" rev-parse --short HEAD 2>/dev/null)"
+_projectTag="$(git -C "${_scriptRoot}" describe --tags 2>/dev/null)"
+_userAgent="${_projectName}/${_projectTag} ${_projectCommit:-HEAD}"
+
+#  _____                 _   _
+# |  ___|   _ _ __   ___| |_(_) ___  _ __  ___
+# | |_ | | | | '_ \ / __| __| |/ _ \| '_ \/ __|
+# |  _|| |_| | | | | (__| |_| | (_) | | | \__ \
+# |_|   \__,_|_| |_|\___|\__|_|\___/|_| |_|___/
+#
+
+function checkDep {
+  if ! which which >/dev/null 2>&1
+  then
+    echo "Need which for dep resolution"
+    exit 1
+  fi
+}
+
+function urldecode { # Capable of decoding double-encoded strings.
+  iters=0
+  result="${*}"
+  until [ -n "$result" ] && ! [[ $result =~ %[0-9]{2} ]] || [ $iters -ge 10 ]
+  do
+    : "${result:-${*}//+/ }"             # Noop with a first argument holding the result of replacing plusses with spaces.
+    result="$(echo -e "${_//%/\\x}")"    # Take the last command's last argument and replace %'s with a \x hex escape. Process with echo.
+    ((iters++))
+  done
+
+  echo $result
+}
+
+function printHelp {
+  echo    "Usage:"
+  echo    "$0"
+
+  echo -e "\t\$url\t(game-soundtracks URL for OST to be downloaded)"
+  echo -e "\t-threads 5\t(Optional threaded downloading)"
+  echo -e "\t-threads 5\t(Optional threaded downloading)"
+}
+
+#  ____
+# |  _ \ _ __ ___ _ __
+# | |_) | '__/ _ \ '_ \
+# |  __/| | |  __/ |_) |
+# |_|   |_|  \___| .__/
+#                |_|
+
+checkDep curl wget
+
+while [ $# -gt 0 ]
+do
+  case "$(tr '[:upper:]' '[:lower:]'<<<$1)" in
+    -threads|-parallel)
+      if ! which parallel >/dev/null 2>&1
+      then
+        echo "Can't find parallel in path"
+        exit 1
+      fi
+
+      if ! [[ $2 =~ [0-9]+ ]]
+      then
+        echo "thread count must be a number."
+        exit 1
+      fi
+
+      threads="$2"
+      shift
+    ;;
+  -url)
+      fullUrl="$2"
+      shift
+    ;;
+    *)
+      if [ -z "$fullUrl" ] && [[ $1 =~ http.*game-soundtracks ]]
+      then
+        echo "URL: $1"
+        fullUrl="$1"
+      else
+        printHelp
+      fi
+        ;;
+  esac
+  shift
+done
+
+if [ -z "${fullUrl}" ]
+then
+  echo "Can't run without a /game-soundtracks/ album OST URL."
+  exit 1
+fi
+
+ostPath="${fullUrl##*/}"
+baseUrl=$(awk -F'/' '{print $1 "/" $2 "/" $3}' <<< "${fullUrl}")
+
+# Cache as much as we can to reduce repeated visits.
+cachePath="/tmp/${ostPath}"
+cachePathIndex="/tmp/${fullUrl##*/}/index.html"
+mkdir -p "${cachePath}"
+
+if [ ! -f "${cachePathIndex}" ]
+then
+  pageHtml="$(curl -A "${_userAgent}" -Ss "${fullUrl}")"
+  if [ -n "${pageHtml}" ]
+  then
+    echo "${pageHtml}" > "${cachePathIndex}"
+  else
+    echo "Failed to load the OST page for "
+    exit 1
+  fi
+else
+  pageHtml="$(cat "${cachePathIndex}")"
+fi
+
+
+ostTitle="$(grep -Po '(?<=<h2>).*(?=\<a)' <<< "${pageHtml}")"
+ostDir="${_scriptRoot}/${ostTitle}"
+trackList="$(awk -F'"' '/href="\/game-soundtracks.*mp3"/ {for(i=1;i<=NF;i++) if ($i ~ "game-soundtracks" && !seen[$i]) {print $i; ++seen[$i]}}' <<< "${pageHtml}")"
+
+
+for track in ${trackList}
+do
+  trackPath="${track##*/}"
+  trackName="$(urldecode "${track##*/}")"
+  trackUrlFull="${baseUrl}${track}"
+
+  # Cache here too
+  cachePathTrack="${cachePath}/${trackPath}.html"
+  if [ ! -f "${cachePathTrack}" ]
+  then
+    echo "Fetching track page: ${trackName}..."
+    pageHtmlTrack="$(curl -A "${_userAgent}" -Ss "${baseUrl}${track}")"
+    if [ -n "${pageHtmlTrack}" ]
+    then
+      echo "${pageHtmlTrack}" > "${cachePathTrack}"
+    else
+      echo "Failed to get the page for $(urldecode "${trackName}")"
+    fi
+  else
+    pageHtmlTrack="$(cat "${cachePathTrack}")"
+  fi
+
+
+  downloadUrls+=("$(awk -F'"' '/.flac/ {for(i=1;i<=NF;i++) if ($i ~ ".flac") {print $i}}' <<< "${pageHtmlTrack}")")
+done
+
+
+if [ ${#downloadUrls[@]} -gt 0 ]
+then
+  mkdir -pv "${ostDir}"
+  if [ -z "$threads" ]
+  then
+    echo "No threading specified, downloading sequentially with wget to ${ostTitle} in the script root"
+    # --timestamping over --no-clobber allows resumption of partially finished files -
+    # though this doesn't seem to be working for khinsider.com. Content-Length and Timestamps may be disabled on the webserver.
+    wget --continue --directory-prefix="${ostDir}" --quiet --show-progress --timestamping ${downloadUrls[@]} 
+  else
+    for URL in ${downloadUrls[@]}
+    do
+      echo "echo \"Downloading $(urldecode "${URL##*/}")...\" >&2 && wget --continue --directory-prefix=\"${ostDir}\" --quiet --timestamping \"${URL}\""
+    done | parallel -j${threads}
+  fi
+else
+  echo "Failed to extract download URLs. Exiting."
+  exit 1
+fi
